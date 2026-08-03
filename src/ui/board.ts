@@ -35,6 +35,7 @@ import {
 } from "./task-viewer-with-search.ts";
 import { createScreen } from "./tui.ts";
 import { stripBlessedFgTags } from "./utils/strip-tags.ts";
+import { visibleLength, wrapBlessedText } from "./utils/wrap-tags.ts";
 
 export type ColumnData = {
 	status: string;
@@ -72,10 +73,38 @@ type ColumnView = {
 	tasks: Task[];
 	list: ListInterface;
 	box: BoxInterface;
-	richItems: string[];
-	plainItems: string[];
+	// One entry per task, each holding the display rows that task occupies.
+	// A wrapped card spans several rows, so rows and tasks are no longer 1:1.
+	richItems: string[][];
+	plainItems: string[][];
+	rowByTaskIndex: number[];
+	taskIndexByRow: number[];
 	highlightedIndex?: number;
 };
+
+/**
+ * Flattens per-task rows into the flat array the list widget wants, keeping the
+ * mapping needed to translate between widget rows and task indices.
+ */
+function flattenColumnItems(items: string[][]): {
+	rows: string[];
+	rowByTaskIndex: number[];
+	taskIndexByRow: number[];
+} {
+	const rows: string[] = [];
+	const rowByTaskIndex: number[] = [];
+	const taskIndexByRow: number[] = [];
+
+	items.forEach((lines, taskIndex) => {
+		rowByTaskIndex[taskIndex] = rows.length;
+		for (const line of lines) {
+			taskIndexByRow[rows.length] = taskIndex;
+			rows.push(line);
+		}
+	});
+
+	return { rows, rowByTaskIndex, taskIndexByRow };
+}
 
 function isDoneStatus(status: string): boolean {
 	const normalized = status.trim().toLowerCase();
@@ -163,11 +192,20 @@ export function formatTaskListItem(task: Task, isMoving = false): string {
 	return content;
 }
 
-function buildRenderedTaskListItems(tasks: Task[], movingTaskId?: string): { rich: string[]; plain: string[] } {
-	const rich = tasks.map((task) => formatTaskListItem(task, movingTaskId === task.id));
+function buildRenderedTaskListItems(
+	tasks: Task[],
+	movingTaskId?: string,
+	wrapWidth = 0,
+): { rich: string[][]; plain: string[][] } {
+	const rich = tasks.map((task) => {
+		const item = formatTaskListItem(task, movingTaskId === task.id);
+		// Card titles are the whole point of a column, so wrap rather than clip
+		// them when the column is too narrow to show the title in one row.
+		return wrapWidth > 0 ? wrapBlessedText(item, wrapWidth, "  ") : [item];
+	});
 	return {
 		rich,
-		plain: rich.map((item) => stripBlessedFgTags(item)),
+		plain: rich.map((lines) => lines.map((line) => stripBlessedFgTags(line))),
 	};
 }
 
@@ -452,16 +490,53 @@ export async function renderBoardTui(
 
 		const columnWidthFor = (count: number) => Math.max(1, Math.floor(100 / Math.max(1, count)));
 
+		const getColumnContentWidth = (column: ColumnView): number => {
+			const rawWidth = column.list?.width;
+			const width = typeof rawWidth === "number" ? rawWidth : 0;
+			return width > 0 ? Math.max(1, width) : 0;
+		};
+
+		/**
+		 * Applies the selected styling to a continuation row, padded to the full
+		 * width so the highlight reads as one solid block rather than ragged text.
+		 * Mirrors the move-mode colours the list style switches to.
+		 */
+		const decorateContinuationRow = (line: string, width: number): string => {
+			const padding = width > 0 ? " ".repeat(Math.max(0, width - visibleLength(line))) : "";
+			const body = `${line}${padding}`;
+			return moveOp ? `{black-fg}{cyan-bg}${body}{/cyan-bg}{/black-fg}` : `{inverse}{bold}${body}{/bold}{/inverse}`;
+		};
+
+		/**
+		 * Translates the widget's selected row into a task index. Every caller
+		 * treats the result as a task index, including destructive actions, so
+		 * this must never leak a raw row number once cards can span rows.
+		 */
 		const getSelectedRowIndex = (column: ColumnView): number => {
-			const selected = (column.list as MutableList).selected ?? 0;
-			return Math.max(0, Math.min(selected, Math.max(0, column.tasks.length - 1)));
+			const selectedRow = (column.list as MutableList).selected ?? 0;
+			const lastTaskIndex = Math.max(0, column.tasks.length - 1);
+			const mapped = column.taskIndexByRow[selectedRow];
+			if (mapped === undefined) {
+				return Math.max(0, Math.min(selectedRow, lastTaskIndex));
+			}
+			return Math.max(0, Math.min(mapped, lastTaskIndex));
 		};
 
 		const setColumnItemContent = (column: ColumnView, index: number, usePlain: boolean) => {
 			if (index < 0 || index >= column.tasks.length) return;
-			const content = usePlain ? column.plainItems[index] : column.richItems[index];
-			if (!content) return;
-			(column.list as MutableList).setItem?.(index, content);
+			const lines = usePlain ? column.plainItems[index] : column.richItems[index];
+			if (!lines || lines.length === 0) return;
+			const firstRow = column.rowByTaskIndex[index];
+			if (firstRow === undefined) return;
+			const setItem = (column.list as MutableList).setItem;
+			if (!setItem) return;
+			// The widget styles only the row it considers selected, so continuation
+			// rows carry the highlight themselves or the bar covers just the top line.
+			const width = getColumnContentWidth(column);
+			lines.forEach((line, row) => {
+				const content = usePlain && row > 0 ? decorateContinuationRow(line, width) : line;
+				setItem.call(column.list, firstRow + row, content);
+			});
 		};
 
 		const syncColumnSelectionDisplay = (column: ColumnView | undefined, active: boolean) => {
@@ -482,18 +557,20 @@ export async function renderBoardTui(
 				return;
 			}
 			const nextIndex = Math.max(0, Math.min(index, column.tasks.length - 1));
+			// Callers pass a task index; the widget needs that task's first row.
+			const targetRow = column.rowByTaskIndex[nextIndex] ?? nextIndex;
 			programmaticColumnSelection = true;
 			try {
-				column.list.select(nextIndex);
+				column.list.select(targetRow);
 			} finally {
 				programmaticColumnSelection = false;
 			}
-			(column.list as MutableList).selected = nextIndex;
+			(column.list as MutableList).selected = targetRow;
 			syncColumnSelectionDisplay(column, active);
 		};
 
-		const getFormattedItems = (tasks: Task[]) => {
-			return buildRenderedTaskListItems(tasks, moveOp?.taskId);
+		const getFormattedItems = (tasks: Task[], wrapWidth = 0) => {
+			return buildRenderedTaskListItems(tasks, moveOp?.taskId, wrapWidth);
 		};
 
 		const createColumnViews = (data: ColumnData[]) => {
@@ -527,8 +604,10 @@ export async function renderBoardTui(
 					style: { selected: {} },
 				});
 
-				const renderedItems = getFormattedItems(columnData.tasks);
-				taskList.setItems(renderedItems.rich);
+				const listWidth = typeof taskList.width === "number" ? taskList.width : 0;
+				const renderedItems = getFormattedItems(columnData.tasks, listWidth);
+				const flattened = flattenColumnItems(renderedItems.rich);
+				taskList.setItems(flattened.rows);
 				columns.push({
 					status: columnData.status,
 					tasks: columnData.tasks,
@@ -536,6 +615,8 @@ export async function renderBoardTui(
 					box: columnBox,
 					richItems: renderedItems.rich,
 					plainItems: renderedItems.plain,
+					rowByTaskIndex: flattened.rowByTaskIndex,
+					taskIndexByRow: flattened.taskIndexByRow,
 				});
 
 				taskList.on("select item", (_item: unknown, selected: unknown) => {
@@ -595,7 +676,7 @@ export async function renderBoardTui(
 		const getSelectedTaskId = (): string | undefined => {
 			const column = columns[currentCol];
 			if (!column) return undefined;
-			const selectedIndex = column.list.selected ?? 0;
+			const selectedIndex = getSelectedRowIndex(column);
 			return column.tasks[selectedIndex]?.id;
 		};
 
@@ -611,7 +692,8 @@ export async function renderBoardTui(
 
 			const total = current.tasks.length;
 			if (total > 0) {
-				const previousSelected = typeof previous?.list.selected === "number" ? previous.list.selected : 0;
+				// Carried across columns as a task index, not a widget row.
+				const previousSelected = previous ? getSelectedRowIndex(previous) : 0;
 				const target = preferredRow !== undefined ? preferredRow : Math.min(previousSelected, total - 1);
 				selectColumnRow(current, target, activate);
 			}
@@ -651,11 +733,14 @@ export async function renderBoardTui(
 				if (!column) return;
 				column.status = columnData.status;
 				column.tasks = columnData.tasks;
-				const renderedItems = getFormattedItems(columnData.tasks);
+				const renderedItems = getFormattedItems(columnData.tasks, getColumnContentWidth(column));
+				const flattened = flattenColumnItems(renderedItems.rich);
 				column.richItems = renderedItems.rich;
 				column.plainItems = renderedItems.plain;
+				column.rowByTaskIndex = flattened.rowByTaskIndex;
+				column.taskIndexByRow = flattened.taskIndexByRow;
 				column.highlightedIndex = undefined;
-				column.list.setItems(renderedItems.rich);
+				column.list.setItems(flattened.rows);
 				column.box.setLabel?.(formatColumnLabel(columnData.status, columnData.tasks.length));
 			});
 			restoreSelection(selectedTaskId);
@@ -1068,8 +1153,7 @@ export async function renderBoardTui(
 			} else {
 				const column = columns[currentCol];
 				if (!column) return;
-				const listWidget = column.list;
-				const selected = listWidget.selected ?? 0;
+				const selected = getSelectedRowIndex(column);
 				const total = column.tasks.length;
 				if (total === 0) {
 					pendingSearchWrap = null;
@@ -1105,8 +1189,7 @@ export async function renderBoardTui(
 			} else {
 				const column = columns[currentCol];
 				if (!column) return;
-				const listWidget = column.list;
-				const selected = listWidget.selected ?? 0;
+				const selected = getSelectedRowIndex(column);
 				const total = column.tasks.length;
 				if (total === 0) {
 					pendingSearchWrap = null;
@@ -1142,7 +1225,7 @@ export async function renderBoardTui(
 			if (isBoardLaneNavigationBlocked()) return;
 			const column = columns[currentCol];
 			if (!column) return;
-			const selected = column.list.selected ?? 0;
+			const selected = getSelectedRowIndex(column);
 			const nextIndex = Math.max(0, selected - lanePageAmount());
 			selectColumnRow(column, nextIndex, true);
 			screen.render();
@@ -1152,7 +1235,7 @@ export async function renderBoardTui(
 			if (isBoardLaneNavigationBlocked()) return;
 			const column = columns[currentCol];
 			if (!column) return;
-			const selected = column.list.selected ?? 0;
+			const selected = getSelectedRowIndex(column);
 			const total = column.tasks.length;
 			if (total === 0) return;
 			const nextIndex = Math.min(total - 1, selected + lanePageAmount());
@@ -1224,7 +1307,7 @@ export async function renderBoardTui(
 
 			const column = columns[currentCol];
 			if (!column) return;
-			const idx = column.list.selected ?? 0;
+			const idx = getSelectedRowIndex(column);
 			if (idx < 0 || idx >= column.tasks.length) return;
 			const task = column.tasks[idx];
 			if (!task) return;
@@ -1338,7 +1421,7 @@ export async function renderBoardTui(
 			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters") return;
 			const column = columns[currentCol];
 			if (!column) return;
-			const idx = column.list.selected ?? 0;
+			const idx = getSelectedRowIndex(column);
 			if (idx < 0 || idx >= column.tasks.length) return;
 			const task = column.tasks[idx];
 			if (!task) return;
@@ -1420,7 +1503,7 @@ export async function renderBoardTui(
 			if (!moveOp) {
 				const column = columns[currentCol];
 				if (!column) return;
-				const taskIndex = column.list.selected ?? 0;
+				const taskIndex = getSelectedRowIndex(column);
 				const task = column.tasks[taskIndex];
 				if (!task) return;
 
@@ -1450,7 +1533,7 @@ export async function renderBoardTui(
 			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters") return;
 			const column = columns[currentCol];
 			if (column) {
-				const idx = column.list.selected ?? 0;
+				const idx = getSelectedRowIndex(column);
 				if (idx >= 0 && idx < column.tasks.length) {
 					const task = column.tasks[idx];
 					if (task) options?.onTaskSelect?.(task);
@@ -1482,7 +1565,7 @@ export async function renderBoardTui(
 			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters") return;
 			const column = columns[currentCol];
 			if (!column) return;
-			const idx = column.list.selected ?? 0;
+			const idx = getSelectedRowIndex(column);
 			const task = column.tasks[idx];
 			if (!task) return;
 
@@ -1498,7 +1581,7 @@ export async function renderBoardTui(
 			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters" || moveOp) return;
 			const column = columns[currentCol];
 			if (!column) return;
-			const idx = column.list.selected ?? 0;
+			const idx = getSelectedRowIndex(column);
 			const task = column.tasks[idx];
 			if (!task) return;
 
@@ -1541,7 +1624,7 @@ export async function renderBoardTui(
 			if (popupOpen || filterPopupOpen || modalOpen || currentFocus === "filters" || moveOp) return;
 			const column = columns[currentCol];
 			if (!column) return;
-			const idx = column.list.selected ?? 0;
+			const idx = getSelectedRowIndex(column);
 			const task = column.tasks[idx];
 			if (!task) return;
 
